@@ -1,0 +1,213 @@
+/**
+ * Auto-email and per-package limit handling (Package A: 50+10, Package B: 100+20)
+ * Includes Quota Handling and Bulk Send for Pending emails.
+ */
+
+const CONFIG = {
+  FORM_ID: '1uIJkTDo5OAhn8-Gk5gAPv2NGm5WsOWbwnIPFbtsKqxo',
+  RESPONSE_SHEET_NAME: 'MAID 2026 Registration Form (Responses)',
+  EVENT_NAME: 'MAID 2026',
+  PAYMENT_DUE_DATE: '19 Jan 2026',
+  ADMIN_EMAIL: 'mmiyoungmedics@gmail.com',
+  BANK: {
+    name: 'Public Bank Berhad',
+    holder: 'Pertubuhan Pelajar Pelajar Perubatan Antarabangsa',
+    account: '3192906011',
+    method: 'DuitNow Transfer'
+  },
+  PROOF_OF_PAYMENT_FORM: 'https://forms.gle/1tEGRwbkPra4SHJ2A',
+  SENDER_NAME: 'MMI Young Medics' ,
+
+  // 🎫 Ticket Packages and limits
+  TICKETS: {
+    "Package A": {
+      name: "Package A: NORMAL with (Softcopy Info Pack)",
+      price: "RM 25",
+      CONFIRMED: 50,
+      WAITLIST: 10
+    },
+    "Package B": {
+      name: "Package B: NORMAL with (Info Pack + Conference Kit)",
+      price: "RM 70",
+      CONFIRMED: 100,
+      WAITLIST: 10
+    }
+  }
+};
+
+function onFormSubmit(e) {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var sheet = ss.getSheetByName(CONFIG.RESPONSE_SHEET_NAME) || ss.getSheets()[0];
+    var lastRow = sheet.getLastRow();
+    var headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    
+    // Process Submission Data
+    var result = processSubmission(e.namedValues, sheet, headers);
+    
+    // Write back status to Spreadsheet
+    var statusColIndex = headers.indexOf('Status') + 1;
+    if (statusColIndex === 0) {
+      statusColIndex = headers.length + 1;
+      sheet.getRange(1, statusColIndex).setValue('Status');
+    }
+    
+    // BUG FIX: If quota is full, save the status result but add "Pending" 
+    // so we don't have to guess their position later.
+    if (MailApp.getRemainingDailyQuota() < 1) {
+      sheet.getRange(lastRow, statusColIndex).setValue(result.statusText.replace('email sent', 'Pending (Quota Full)'));
+      return;
+    }
+
+    // Attempt Send
+    MailApp.sendEmail(result.email, result.subject, '', { htmlBody: result.htmlBody, name: CONFIG.SENDER_NAME });
+    sheet.getRange(lastRow, statusColIndex).setValue(result.statusText);
+
+  } catch (err) {
+    console.error(err);
+    if (MailApp.getRemainingDailyQuota() > 0) {
+      MailApp.sendEmail(CONFIG.ADMIN_EMAIL, 'Script Error: ' + CONFIG.EVENT_NAME, err.message);
+    }
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * NEW: Logic to process data and determine which email to send
+ * Extracted so it can be reused by both the trigger and the Manual Send function.
+ */
+function processSubmission(named, sheet, headers, limitRow) {
+  // 1. Get Email
+  var email = (named['Email Address'] ? named['Email Address'][0] : "").trim();
+  if (!email || email.indexOf('@') === -1) {
+    for (var key in named) {
+      var val = (named[key][0] || "").toString();
+      if (val.includes('@') && val.includes('.')) { email = val; break; }
+    }
+  }
+
+  // 2. Get Ticket Type
+  var rawTicketChoice = "";
+  for (var key in named) {
+    if (key.toLowerCase().includes('ticket') || key.toLowerCase().includes('package')) {
+      rawTicketChoice = named[key][0];
+      break;
+    }
+  }
+
+  var ticketType = "";
+  var ticketDetails = null;
+  for (var key in CONFIG.TICKETS) {
+    if (rawTicketChoice.toLowerCase().indexOf(key.toLowerCase()) !== -1) {
+      ticketType = key;
+      ticketDetails = CONFIG.TICKETS[key];
+      break;
+    }
+  }
+  if (!ticketDetails) {
+    ticketDetails = { name: rawTicketChoice || 'Your Selected Ticket', price: 'TBD', CONFIRMED: 0, WAITLIST: 0 };
+  }
+
+  // 3. Count Position
+  var data = sheet.getDataRange().getValues();
+  var ticketCol = -1;
+  for (var c = 0; c < headers.length; c++) {
+    if (headers[c].toLowerCase().indexOf('ticket') !== -1 || headers[c].toLowerCase().indexOf('package') !== -1) {
+      ticketCol = c; break;
+    }
+  }
+
+  // BUG FIX: Only count rows up to the limitRow (the person being processed)
+  // If no limitRow is provided (live submission), use the full sheet.
+  var packageCount = 0;
+  var endRow = limitRow || data.length; 
+
+  for (var r = 1; r < endRow; r++) {
+    var val = (data[r][ticketCol] || '').toString().trim().toLowerCase();
+    if (ticketType && val.indexOf(ticketType.toLowerCase()) !== -1) packageCount++;
+  }
+
+  var position = packageCount;
+  var subject = "";
+  var htmlBody = "";
+  var statusText = "";
+
+  // 4. Generate Content (Original Email Logic Kept Intact)
+  if (position <= ticketDetails.CONFIRMED) {
+    subject = CONFIG.EVENT_NAME + ' — Registration Confirmed';
+    htmlBody = '<p>Dear Participant,</p><p>Congratulations! You have successfully secured a ticket for <strong>' + CONFIG.EVENT_NAME + '</strong>.</p>' +
+               '<p>🎫 <strong>Ticket Details:</strong><br>' + ticketDetails.name + ' - ' + ticketDetails.price + '</p>' +
+               '<p>To secure your spot, please submit your payment using this form:<br><a href="' + CONFIG.PROOF_OF_PAYMENT_FORM + '">' + CONFIG.PROOF_OF_PAYMENT_FORM + '</a></p>' +
+               '<p>📅 <strong>Payment Due Date:</strong> ' + CONFIG.PAYMENT_DUE_DATE + '</p>' +
+               '<p>Best regards,<br>' + CONFIG.SENDER_NAME + '</p>';
+    statusText = 'Confirmed (' + ticketType + ') — email sent';
+  } else if (position <= (Number(ticketDetails.CONFIRMED) + Number(ticketDetails.WAITLIST))) {
+    var waitlistPos = position - ticketDetails.CONFIRMED;
+    subject = CONFIG.EVENT_NAME + ' — Waitlist (Backup)';
+    htmlBody = '<p>Dear Participant,</p><p>You are on the <strong>backup (waitlist)</strong> for <strong>' + ticketType + '</strong>.</p>' +
+               '<p>We will contact you if a spot opens by <strong>' + CONFIG.PAYMENT_DUE_DATE + '</strong>.</p>' +
+               '<p>Best regards,<br>' + CONFIG.SENDER_NAME + '</p>';
+    statusText = 'Waitlist #' + waitlistPos + ' (' + ticketType + ') — email sent';
+  } else {
+    subject = CONFIG.EVENT_NAME + ' — Package ' + (ticketType || 'Selected') + ' Sold Out';
+    htmlBody = '<p>Dear Participant,</p><p>Unfortunately, all spots for <strong>' + ticketType + '</strong> are taken.</p>' +
+               '<p>Best regards,<br>' + CONFIG.SENDER_NAME + '</p>';
+    statusText = 'Rejected (Sold Out ' + ticketType + ') — email sent';
+  }
+
+  return { email: email, subject: subject, htmlBody: htmlBody, statusText: statusText };
+}
+
+/**
+ * NEW: Run this function manually to send emails that failed due to quota
+ */
+function sendPendingEmails() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName(CONFIG.RESPONSE_SHEET_NAME) || ss.getSheets()[0];
+  var data = sheet.getDataRange().getValues();
+  var headers = data[0];
+  var statusColIndex = headers.indexOf('Status');
+  
+  if (statusColIndex === -1) return;
+
+  var sentCount = 0;
+  for (var i = 1; i < data.length; i++) {
+    var currentStatus = data[i][statusColIndex].toString();
+    
+    // Check if the row is marked as Pending
+    if (currentStatus.indexOf('Pending') !== -1) {
+      if (MailApp.getRemainingDailyQuota() < 1) {
+        Logger.log("Quota still empty/low. Stopping.");
+        break;
+      }
+
+      var rowNamedValues = {};
+      for (var j = 0; j < headers.length; j++) {
+        rowNamedValues[headers[j]] = [data[i][j]];
+      }
+
+      // BUG FIX: Pass a "sliced" version of the sheet that only goes up to the current row (i+1)
+      // This prevents the counter from seeing the 9th person when processing the 7th person.
+      var virtualSheet = sheet; 
+      var result = processSubmission(rowNamedValues, virtualSheet, headers, i + 1);
+      
+      try {
+        MailApp.sendEmail(result.email, result.subject, '', { htmlBody: result.htmlBody, name: CONFIG.SENDER_NAME });
+        sheet.getRange(i + 1, statusColIndex + 1).setValue(result.statusText);
+        sentCount++;
+      } catch (e) {
+        Logger.log("Failed to send row " + (i + 1) + ": " + e.message);
+      }
+    }
+  }
+  Logger.log("Successfully sent " + sentCount + " pending emails.");
+}
+
+function checkQuota() {
+  var remainingQuota = MailApp.getRemainingDailyQuota();
+  Logger.log("Remaining email quota: " + remainingQuota);
+}
